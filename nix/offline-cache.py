@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Emit a Nix binary cache from closureInfo metadata without a store database."""
 
 import hashlib

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 {
   description = "Shared engine and closure payloads for native Nix impurifiers";
   inputs = {
