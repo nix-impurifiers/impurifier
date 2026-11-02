@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: MIT
+#
+# GitHub allows 10 GB of Actions cache per repository and evicts by last
+# access once that is exceeded. main keeps one entry (check.yml purges
+# the older ones after each save), but a pull request that changes the
+# pipeline saves entries under its own merge ref, and those would sit
+# for seven days after the request closes. Dropping them at close time
+# keeps the total near one entry, so main's is never the one evicted.
+#
+# Triggered through `pull_request_target`, so the copy that runs is
+# main's: this job holds a token that can delete cache entries, and a
+# request must not be able to edit what it deletes. Nothing from the
+# request's tree runs here.
+
+name: cache-cleanup
+
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  actions: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Delete the cache entries scoped to this pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: refs/pull/${{ github.event.pull_request.number }}/merge
+        run: gh cache delete --all --ref "$REF" --succeed-on-no-caches --repo "$GITHUB_REPOSITORY"

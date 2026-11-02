@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+import importlib.util
+import json
+import pathlib
+import tempfile
+import unittest
+
+spec = importlib.util.spec_from_file_location(
+    "engine", pathlib.Path(__file__).parents[1] / "src/engine.py"
+)
+engine = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(engine)
+
+
+class ManifestTests(unittest.TestCase):
+    def test_reject_invalid_inputs(self):
+        valid = dict(
+            name="tool",
+            version="1",
+            priority=5,
+            installable="/nix/store/" + "0" * 32 + "-tool",
+        )
+        for patch in [
+            dict(installable="/tmp/tool"),
+            dict(priority=True),
+            dict(name="../tool"),
+            dict(installable=valid["installable"] + ".drv"),
+            dict(binaryCache="https://evil"),
+            dict(installable=valid["installable"] + "/bin"),
+        ]:
+            with self.subTest(patch=patch), self.assertRaises(ValueError):
+                engine.validate(valid | patch)
+        self.assertEqual(engine.validate(valid), valid)
+
+    def test_offline_cache_is_owned_by_selected_backend(self):
+        value = dict(
+            name="tool",
+            version="1",
+            priority=5,
+            installable="/nix/store/" + "0" * 32 + "-tool",
+            offlineCache="/usr/share/rpm-impurifier/offline/tool",
+        )
+        with self.assertRaises(ValueError):
+            engine.validate(value, "dpkg-impurifier")
+        self.assertEqual(engine.validate(value, "rpm-impurifier"), value)
+        with self.assertRaises(ValueError):
+            engine.validate(
+                value | {"offlineCache": "/usr/share/rpm-impurifier/offline/other"},
+                "rpm-impurifier",
+            )
+
+    def test_collision_and_priority(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            for name in ["a", "b"]:
+                (root / name / "bin").mkdir(parents=True)
+                (root / name / "bin/tool").write_text(name)
+            entries = [(5, root / "a"), (5, root / "b")]
+            with self.assertRaises(ValueError):
+                engine.compose(root / "bad", entries)
+            engine.compose(root / "good", [(10, root / "a"), (5, root / "b")])
+            self.assertEqual((root / "good/bin/tool").read_text(), "b")
+
+    def test_directories_and_file_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "a/bin").mkdir(parents=True)
+            (root / "a/bin/tool").write_text("a")
+            (root / "b").mkdir()
+            (root / "b/bin").write_text("b")
+            with self.assertRaises(ValueError):
+                engine.compose(root / "bad", [(5, root / "a"), (5, root / "b")])
+
+    def test_prune_preserves_active_and_drops_failed_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            state = root / "state"
+            for name in ["old", "active", "failed"]:
+                (state / "roots" / name).mkdir(parents=True)
+            for name in ["old", "active"]:
+                (state / "generations" / name / "profile").mkdir(parents=True)
+            profile = root / "profile"
+            profile.symlink_to(state / "generations/active/profile")
+            engine.prune(state, profile, 0)
+            self.assertTrue(profile.is_dir())
+            self.assertFalse((state / "generations/old").exists())
+            self.assertFalse((state / "roots/old").exists())
+            self.assertFalse((state / "roots/failed").exists())
+            self.assertTrue((state / "roots/active").exists())
+
+    def test_directory_symlink_cycle_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "a/bin").mkdir(parents=True)
+            (root / "a/bin/cycle").symlink_to(root / "a/bin")
+            with self.assertRaises(ValueError):
+                engine.compose(root / "profile", [(5, root / "a")])
+
+
+if __name__ == "__main__":
+    unittest.main()

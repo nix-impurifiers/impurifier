@@ -1,0 +1,256 @@
+# SPDX-License-Identifier: MIT
+#
+# The pull request's own check: this file is the pull request's copy,
+# run in the pull request's context, where any cache it saves is
+# scoped to the request's merge ref and can be restored only by that
+# request's later runs, never by main.
+#
+# check.yml (main's copy, triggered by this run's completion) builds
+# every pull request that leaves the pipeline alone, so this run
+# succeeds at once for those. A request that changes .github/ is
+# exactly the one check.yml declines to build, and the only one whose
+# new pipeline needs exercising; it is built here, restoring main's
+# entry and saving under its own scope. Between the two files, each
+# push is built exactly once.
+#
+# The roots and the priority pruning are the same as in check.yml, with
+# one difference: this run's token cannot delete cache entries, so it
+# never touches another scope's and does not purge its own; entries in
+# a request's scope go when the request closes (cache-cleanup.yml) or
+# when GitHub expires them.
+
+name: check-pr
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+
+concurrency:
+  group: check-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check-pr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # The build cache on disk: a Nix binary cache plus the root tree
+      # under roots/, carried whole in one Actions cache entry. The
+      # hosted runners' home directory, spelled out because nix.conf
+      # cannot expand it.
+      CI_CACHE: /home/runner/ci-cache
+      # Caches whose paths are left out of the entry, space-separated.
+      UPSTREAM_CACHES: https://cache.nixos.org
+    steps:
+      - name: Decide whether this run builds
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate \
+               --jq '.[].filename' | grep -q '^\.github/'; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "This pull request leaves the pipeline alone; check.yml builds it."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: steps.guard.outputs.build == 'true'
+        with:
+          persist-credentials: false
+
+      # Restores the newest entry this run can see (its own earlier one,
+      # else main's); the save, under this request's scope, one entry
+      # per head commit, is the last step. cache-cleanup.yml removes
+      # them all when the request closes.
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        if: steps.guard.outputs.build == 'true'
+        with:
+          path: ${{ env.CI_CACHE }}
+          key: cache-${{ runner.os }}-${{ github.event.pull_request.head.sha }}
+          restore-keys: cache-${{ runner.os }}-
+
+      # A binary cache needs its directories and its info file before
+      # anything opens it; created here, owned by this user, so that
+      # neither the daemon (which opens it as a substituter, as root)
+      # nor `nix copy` (which writes it, as this user) is the first to.
+      - name: Prepare the build cache
+        if: steps.guard.outputs.build == 'true'
+        run: |
+          mkdir -p "$CI_CACHE/nar" "$CI_CACHE/roots"
+          [[ -e "$CI_CACHE/nix-cache-info" ]] || echo "StoreDir: /nix/store" > "$CI_CACHE/nix-cache-info"
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        if: steps.guard.outputs.build == 'true'
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            sandbox = true
+            # The restored cache. Its paths carry no signatures; `trusted`
+            # accepts them from this store alone.
+            extra-substituters = file://${{ env.CI_CACHE }}?trusted=true
+
+      # Pull from the clhodapp cache; a public cache needs no credentials
+      # to read, and this run has none. Nothing is pushed from here.
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        if: steps.guard.outputs.build == 'true'
+        with:
+          name: clhodapp
+          skipPush: true
+          # The clhodapp cache's upstreams, which a user of it pulls
+          # from too.
+          extraPullNames: nix-community,numtide
+
+      - name: Run the flake checks
+        if: steps.guard.outputs.build == 'true'
+        run: nix flake check --print-build-logs
+
+      - name: Root this build and apply the cache priorities
+        if: steps.guard.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ROOT_CLASS: pr
+          ROOT_ID: ${{ format('{0}/{1}', github.event.pull_request.number, github.event.pull_request.head.sha) }}
+          CURRENT_MAIN: ${{ github.event.pull_request.base.sha }}
+          OWN_REF: ${{ github.ref }}
+          KEY_PREFIX: cache-${{ runner.os }}-
+          MAY_DELETE: "false"
+        run: |
+          set -euo pipefail
+          # The persistent root tree, inside the cache directory so the
+          # entry carries it. A root lists the store paths its build
+          # contributes to the entry: its closure, less what the
+          # upstream caches served.
+          roots="$CI_CACHE/roots"
+          store="file://$CI_CACHE?compression=zstd&parallel-compression=true"
+
+          # 1. Root what this run built.
+          own="$roots/$ROOT_CLASS/$ROOT_ID"
+          rm -rf "$own"
+          mkdir -p "$own"
+          # Checks and packages both: a check's output need not reference
+          # what it built, and the pruning keeps only what the roots reach.
+          # An output the flake does not provide (this one has no
+          # packages) is skipped; any other evaluation error fails.
+          for kind in checks packages; do
+            if ! names=$(nix eval --json ".#$kind.x86_64-linux" --apply builtins.attrNames 2>"$RUNNER_TEMP/eval.err"); then
+              grep -q 'does not provide attribute' "$RUNNER_TEMP/eval.err" || { cat "$RUNNER_TEMP/eval.err"; exit 1; }
+              continue
+            fi
+            for name in $(jq -r '.[]' <<<"$names"); do
+              nix build --no-link --print-out-paths ".#$kind.x86_64-linux.$name" >> "$own/outputs"
+            done
+          done
+
+          # 2. Copy the closure into the cache, then ask each upstream cache
+          #    which of it it serves (a cache serves a path when it has
+          #    the path's narinfo file; a failed request counts as not
+          #    served, which only keeps more); the root lists the rest.
+          #    The whole closure goes in because a binary cache refuses a
+          #    path whose references it lacks; the served paths come out
+          #    again in step 6, and compressing them costs seconds.
+          xargs nix copy --to "$store" < "$own/outputs"
+          xargs nix path-info -r < "$own/outputs" | sort -u > "$RUNNER_TEMP/closure"
+          for cache in $UPSTREAM_CACHES; do
+            # shellcheck disable=SC2016
+            cut -c 12-43 "$RUNNER_TEMP/closure" | xargs -P 32 -I{} sh -c \
+              'if curl -sfI --retry 3 -o /dev/null "$1/$2.narinfo"; then echo "$2"; fi' _ "$cache" {}
+          done | sort -u > "$RUNNER_TEMP/served"
+          awk 'FILENAME == ARGV[1] { served[$1] = 1; next } !(substr($0, 12, 32) in served)' \
+            "$RUNNER_TEMP/served" "$RUNNER_TEMP/closure" > "$own/paths"
+          echo "This build: $(wc -l < "$RUNNER_TEMP/closure") paths in the closure, $(wc -l < "$RUNNER_TEMP/served") served upstream, $(wc -l < "$own/paths") kept."
+
+          # 3. Order every root directory, highest priority first.
+          open=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 500 --json number --jq '.[].number')
+          is_open() { grep -qx "$1" <<<"$open"; }
+          # Entry names under a directory, newest first by modification time.
+          newest_in() {
+            [[ -d "$1" ]] || return 0
+            find "$1" -mindepth 1 -maxdepth 1 -printf '%T@ %f\n' | sort -rn | awk '{print $2}'
+          }
+          ordered=()
+          [[ -d "$roots/main/$CURRENT_MAIN" ]] && ordered+=("$roots/main/$CURRENT_MAIN")
+          shopt -s nullglob
+          for prdir in "$roots"/pr/*/; do
+            n=$(basename "$prdir")
+            newest=$(newest_in "$prdir" | head -n1)
+            for sha in "$prdir"/*/; do
+              [[ "$(basename "$sha")" == "$newest" ]] || rm -rf "$sha"
+            done
+            is_open "$n" && ordered+=("$prdir$newest")
+          done
+          for sha in $(newest_in "$roots/main"); do
+            [[ "$sha" == "$CURRENT_MAIN" ]] || ordered+=("$roots/main/$sha")
+          done
+          for prdir in "$roots"/pr/*/; do
+            n=$(basename "$prdir")
+            is_open "$n" || ordered+=("$prdir$(newest_in "$prdir" | head -n1)")
+          done
+
+          # 4. The budget, as in check.yml.
+          gib=$((1024 * 1024 * 1024))
+          caches=$(gh cache list --repo "$GITHUB_REPOSITORY" --limit 1000 --json key,ref,sizeInBytes)
+          used_by_own_scope=$(jq --arg ref "$OWN_REF" --arg p "$KEY_PREFIX" \
+            '[.[] | select(.ref == $ref and (.key | startswith($p))) | .sizeInBytes] | add // 0' <<<"$caches")
+          used_by_others=$(jq --arg ref "$OWN_REF" \
+            '[.[] | select(.ref != $ref) | .sizeInBytes] | add // 0' <<<"$caches")
+          budget=$((10 * gib - used_by_own_scope - used_by_others))
+          echo "Budget for this entry: $budget bytes ($used_by_others used by other scopes, $used_by_own_scope by this one)."
+
+          # The compressed size of every path in the cache, by store hash,
+          # from the narinfo files. The entry is these files, so the sum
+          # is close to what GitHub will count.
+          find "$CI_CACHE" -maxdepth 1 -name '*.narinfo' \
+            -exec awk 'FNR == 1 { h = FILENAME; sub(/.*\//, "", h); sub(/\.narinfo$/, "", h) } /^FileSize: / { print h, $2 }' {} + \
+            > "$RUNNER_TEMP/sizes"
+          listed_paths() {
+            # The union of the paths listed by the given root directories.
+            for d in "$@"; do cat "$d/paths"; done | sort -u
+          }
+          entry_size() {
+            # The size of an entry holding what the given roots list.
+            listed_paths "$@" | awk 'FILENAME == ARGV[1] { size[$1] = $2; next } { total += size[substr($0, 12, 32)] } END { print total + 0 }' "$RUNNER_TEMP/sizes" -
+          }
+
+          # 5. Keep the highest-priority roots that fit, drop the rest.
+          #    This run deletes nothing outside its own scope; if not
+          #    even the current main fits, it is saved anyway and
+          #    GitHub's own eviction is the backstop.
+          kept=()
+          for d in "${ordered[@]}"; do
+            size=$(entry_size "${kept[@]}" "$d")
+            if (( size <= budget )) || (( ${#kept[@]} == 0 )); then
+              (( size <= budget )) || echo "::warning::The current main build ($size bytes) exceeds the cache budget ($budget bytes); saving it anyway."
+              kept+=("$d")
+              continue
+            fi
+            echo "Dropping roots $d (the entry would be $size bytes, budget $budget)."
+            rm -rf "$d"
+          done
+          echo "Kept roots:"
+          printf '  %s\n' "${kept[@]}"
+
+          # 6. Prune the cache to what the surviving roots list: first
+          #    every narinfo for a path none of them lists (this run's
+          #    upstream-served paths among them), then every NAR no
+          #    remaining narinfo names.
+          listed_paths "${kept[@]}" | cut -c 12-43 | sort > "$RUNNER_TEMP/keep"
+          find "$CI_CACHE" -maxdepth 1 -name '*.narinfo' -printf '%f\n' | sed 's/\.narinfo$//' | sort \
+            | comm -23 - "$RUNNER_TEMP/keep" | sed "s|.*|$CI_CACHE/&.narinfo|" | xargs -r rm -f
+          find "$CI_CACHE" -maxdepth 1 -name '*.narinfo' -exec sed -n 's|^URL: ||p' {} + | sort -u > "$RUNNER_TEMP/keep-nars"
+          find "$CI_CACHE/nar" -type f -printf 'nar/%f\n' | sort \
+            | comm -23 - "$RUNNER_TEMP/keep-nars" | sed "s|.*|$CI_CACHE/&|" | xargs -r rm -f
+          echo "The entry holds $(wc -l < "$RUNNER_TEMP/keep") paths, $(du -sb "$CI_CACHE" | cut -f1) bytes on disk."
+
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        if: steps.guard.outputs.build == 'true'
+        with:
+          path: ${{ env.CI_CACHE }}
+          key: cache-${{ runner.os }}-${{ github.event.pull_request.head.sha }}
