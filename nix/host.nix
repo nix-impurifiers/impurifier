@@ -6,6 +6,7 @@
   directories,
   systemd,
   openrc ? null,
+  lifecycle ? { },
   hostBackend ? (if openrc != null then "openrc" else "systemd"),
   namespace ? "nix-impurifier",
 }:
@@ -103,6 +104,21 @@ let
   directoryLines = lib.concatStringsSep "\n" (
     lib.mapAttrsToList (path: spec: "d ${path} ${spec.mode} ${spec.user} ${spec.group} -") directorySpec
   );
+  lifecycleScripts = lib.mapAttrs (
+    event: body:
+    assert lib.assertMsg (
+      lib.elem event [
+        "onInstall"
+        "onUpgrade"
+      ]
+      && builtins.isString body
+    ) "invalid lifecycle hook";
+    pkgs.writeText "${name}-${event}" ''
+      #!/bin/sh
+      set -eu
+      ${body}
+    ''
+  ) lifecycle;
   prepareScript = pkgs.writeText "${name}-prepare-host" ''
     #!/bin/sh
     set -eu
@@ -155,6 +171,13 @@ assert lib.assertMsg (
         mode = "0755";
       };
     }
+    // lib.mapAttrs' (
+      event: source:
+      lib.nameValuePair "/usr/lib/${namespace}/lifecycle/${name}/${event}" {
+        inherit source;
+        mode = "0755";
+      }
+    ) lifecycleScripts
     // lib.optionalAttrs prepare {
       "/usr/lib/${namespace}/host/${name}" = {
         source = prepareScript;
@@ -175,9 +198,14 @@ assert lib.assertMsg (
           );
         };
   }
+  // lib.optionalAttrs (lifecycle != { }) {
+    lifecycle = lib.mapAttrs (
+      _: source: builtins.hashString "sha256" (builtins.unsafeDiscardStringContext (toString source))
+    ) lifecycleScripts;
+  }
   // lib.optionalAttrs (hostBackend == "openrc") {
     supervisor = "openrc";
     inherit prepare;
   };
-  enabled = users != { } || directories != { } || service != null;
+  enabled = users != { } || directories != { } || service != null || lifecycle != { };
 }

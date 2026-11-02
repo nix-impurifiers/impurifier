@@ -60,6 +60,16 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             engine.validate(value | {"host": value["host"] | {"supervisor": "arbitrary-shell"}})
 
+    def test_lifecycle_rejects_arbitrary_events_and_script_paths(self):
+        value = dict(name="tool", version="1", priority=5,
+                     installable="/nix/store/" + "0" * 32 + "-tool",
+                     host=dict(sysusers=False, tmpfiles=False, service=None,
+                               lifecycle={"onInstall": "a" * 64}))
+        self.assertEqual(engine.validate(value), value)
+        for hooks in [{"onRemove": "a" * 64}, {"onInstall": "/tmp/script"}]:
+            with self.subTest(hooks=hooks), self.assertRaises(ValueError):
+                engine.validate(value | {"host": value["host"] | {"lifecycle": hooks}})
+
     def test_collision_and_priority(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)

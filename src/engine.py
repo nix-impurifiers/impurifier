@@ -53,7 +53,7 @@ def validate(value, namespace="nix-impurifier"):
         host = value["host"]
         if (
             not isinstance(host, dict)
-            or set(host) - {"sysusers", "tmpfiles", "service", "supervisor", "prepare"}
+            or set(host) - {"sysusers", "tmpfiles", "service", "supervisor", "prepare", "lifecycle"}
             or {"sysusers", "tmpfiles", "service"} - set(host)
             or type(host["sysusers"]) is not bool
             or type(host["tmpfiles"]) is not bool
@@ -61,6 +61,11 @@ def validate(value, namespace="nix-impurifier"):
             or type(host.get("prepare", False)) is not bool
         ):
             raise ValueError("invalid host integration")
+        hooks = host.get("lifecycle", {})
+        if (not isinstance(hooks, dict) or set(hooks) - {"onInstall", "onUpgrade"}
+                or any(not isinstance(revision, str) or not re.fullmatch("[0-9a-f]{64}", revision)
+                       for revision in hooks.values())):
+            raise ValueError("invalid lifecycle hooks")
         service = host["service"]
         if service is not None and (
             not isinstance(service, dict)
@@ -294,6 +299,16 @@ def activate_host(manifests, previous, profile, target, starts, cleanup, state, 
     switch(profile, target / "profile")
     if any(supervisor(m) == "systemd" for m in list(services(cleanup).values()) + list(new.values())):
         run("systemctl", "daemon-reload")
+    previous_by_name = {m["name"]: m for m in previous}
+    for manifest in manifests:
+        prior = previous_by_name.get(manifest["name"])
+        hooks = manifest.get("host", {}).get("lifecycle", {})
+        event = "onInstall" if prior is None else "onUpgrade"
+        changed = (prior is None or prior["installable"] != manifest["installable"]
+                   or prior["version"] != manifest["version"]
+                   or prior.get("host", {}).get("lifecycle", {}) != hooks)
+        if event in hooks and changed:
+            run("/usr/lib/" + namespace + "/lifecycle/" + manifest["name"] + "/" + event)
     for name, manifest in new.items():
         policy = manifest["host"]["service"]
         if name not in old or supervisor(old[name]) != supervisor(manifest):

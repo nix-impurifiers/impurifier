@@ -3,6 +3,7 @@
 let
   args = {
     pkg = pkgs.hello;
+    lifecycle.onInstall = "echo initialized";
     configFiles."/etc/impurifier-test.conf" = pkgs.writeText "config" "original\n";
   };
   application = core.makePayload (args // { mode = "application"; });
@@ -14,6 +15,8 @@ assert integration.configPaths == [ "/etc/impurifier-test.conf" ];
 pkgs.runCommand "impurifier-payload-partition-contract" { } ''
   test -f ${application}/usr/share/nix-profile.d/hello.json
   test ! -e ${application}/etc/impurifier-test.conf
+  test -x ${integration}/usr/lib/nix-impurifier/lifecycle/hello/onInstall
+  test ! -e ${application}/usr/lib/nix-impurifier/lifecycle/hello/onInstall
   test -f ${integration}/etc/impurifier-test.conf
   test ! -e ${integration}/usr/share/nix-profile.d/hello.json
   test -f ${full}/etc/impurifier-test.conf

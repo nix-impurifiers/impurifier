@@ -63,3 +63,5 @@ Run `nix flake check -L` for core unit checks. The dpkg, RPM, ALPM and APK backe
 package-manager VM transactions against this shared source; dpkg additionally
 checks Debian's own apt/dpkg userspace; APK checks Alpine userspace and OpenRC. Backend regressions must be checked when
 changing the engine or payload contract. GPL-3.0-or-later.
+
+Lifecycle hooks `lifecycle.onInstall` and `lifecycle.onUpgrade` accept shell bodies. They run as root after accounts/directories exist and the new profile is published, before service activation. Use `/opt/nix/profile/bin/<tool>` for projected commands and declare native dependencies for other commands. Install hooks run until the application's first successful activation; upgrade hooks run when its output, version or hook revision changes, including native downgrades. A failed hook leaves activation pending and may be retried, so hooks must be idempotent. They do not provide database rollback or exactly-once execution. Flavor-only changes to the same application do not rerun completed hooks.

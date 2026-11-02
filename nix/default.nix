@@ -80,6 +80,7 @@ let
       directories ? { },
       systemd ? null,
       openrc ? null,
+      lifecycle ? { },
       hostBackend ? (if openrc != null then "openrc" else "systemd"),
       mode ? "full",
     }:
@@ -113,6 +114,7 @@ let
           directories
           systemd
           openrc
+          lifecycle
           hostBackend
           namespace
           ;
