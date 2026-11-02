@@ -49,6 +49,17 @@ class ManifestTests(unittest.TestCase):
                 "rpm-impurifier",
             )
 
+    def test_openrc_host_manifest(self):
+        policy = dict(enable=True, startOnInstall=True, restartOnUpgrade=True,
+                      stopOnRemove=True, revision="a" * 64)
+        value = dict(name="tool", version="1", priority=5,
+                     installable="/nix/store/" + "0" * 32 + "-tool",
+                     host=dict(sysusers=False, tmpfiles=False, prepare=True,
+                               supervisor="openrc", service=policy))
+        self.assertEqual(engine.validate(value), value)
+        with self.assertRaises(ValueError):
+            engine.validate(value | {"host": value["host"] | {"supervisor": "arbitrary-shell"}})
+
     def test_collision_and_priority(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -87,6 +98,27 @@ class ManifestTests(unittest.TestCase):
             self.assertFalse((state / "roots/old").exists())
             self.assertFalse((state / "roots/failed").exists())
             self.assertTrue((state / "roots/active").exists())
+
+    def test_prune_keeps_completed_and_pending_host_generations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            state = root / "state"
+            completed = []
+            completed_id = engine.generation_id(completed)
+            pending_id = "a" * 64
+            for name in [completed_id, pending_id, "discard"]:
+                (state / "generations" / name / "profile").mkdir(parents=True)
+                (state / "roots" / name).mkdir(parents=True)
+            (state / "activated.json").write_text(json.dumps(completed))
+            (state / "pending-hosts.json").write_text(json.dumps({
+                "manifests": [], "generations": [pending_id],
+            }))
+            profile = root / "profile"
+            profile.symlink_to(state / "generations" / pending_id / "profile")
+            engine.prune(state, profile, 0)
+            self.assertTrue((state / "generations" / completed_id).exists())
+            self.assertTrue((state / "generations" / pending_id).exists())
+            self.assertFalse((state / "generations/discard").exists())
 
     def test_directory_symlink_cycle_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

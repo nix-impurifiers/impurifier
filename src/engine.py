@@ -53,9 +53,12 @@ def validate(value, namespace="nix-impurifier"):
         host = value["host"]
         if (
             not isinstance(host, dict)
-            or set(host) != {"sysusers", "tmpfiles", "service"}
+            or set(host) - {"sysusers", "tmpfiles", "service", "supervisor", "prepare"}
+            or {"sysusers", "tmpfiles", "service"} - set(host)
             or type(host["sysusers"]) is not bool
             or type(host["tmpfiles"]) is not bool
+            or host.get("supervisor", "systemd") not in {"systemd", "openrc"}
+            or type(host.get("prepare", False)) is not bool
         ):
             raise ValueError("invalid host integration")
         service = host["service"]
@@ -156,10 +159,46 @@ def services(manifests):
     }
 
 
-def service_command(action, unit):
-    # Debian's helper honors policy-rc.d, including image/chroot builds.
-    helper = shutil.which("deb-systemd-invoke")
-    run(helper or "systemctl", action, unit)
+def supervisor(manifest):
+    return manifest.get("host", {}).get("supervisor", "systemd")
+
+
+def service_active(manifest, control=None):
+    if supervisor(manifest) == "openrc":
+        command = [str(control), "status"] if control else ["rc-service", manifest["name"], "status"]
+    else:
+        command = ["systemctl", "is-active", "--quiet", manifest["name"] + ".service"]
+    return subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def service_command(action, manifest, control=None):
+    if supervisor(manifest) == "openrc":
+        if control:
+            run(str(control), action)
+        else:
+            run("rc-service", manifest["name"], action)
+    else:
+        # Debian's helper honors policy-rc.d, including image/chroot builds.
+        helper = shutil.which("deb-systemd-invoke")
+        run(helper or "systemctl", action, manifest["name"] + ".service")
+
+
+def openrc_control(manifest, state):
+    native = Path("/etc/init.d") / manifest["name"]
+    if native.exists():
+        return native
+    # Native removal deletes the runscript before the transaction trigger.
+    # Keep its last effective contents with the rooted profile generation.
+    for generation in sorted((state / "generations").iterdir()):
+        script = generation / "services" / manifest["name"]
+        metadata = generation / "manifest.json"
+        if not script.is_file() or not metadata.is_file():
+            continue
+        for old in json.loads(metadata.read_text()):
+            if (old["name"] == manifest["name"] and old["installable"] == manifest["installable"]
+                    and old.get("host", {}).get("service") == manifest["host"]["service"]):
+                return script
+    raise ValueError("no cached OpenRC runscript for removed service: " + manifest["name"])
 
 
 def atomic_write(path, text):
@@ -174,6 +213,27 @@ def atomic_write(path, text):
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def manifest_text(manifests):
+    return json.dumps(manifests, sort_keys=True, indent=2) + "\n"
+
+
+def generation_id(manifests):
+    return hashlib.sha256(manifest_text(manifests).encode()).hexdigest()
+
+
+def host_plan(state, namespace):
+    path = state / "pending-hosts.json"
+    plan = json.loads(path.read_text()) if path.exists() else {"manifests": [], "generations": []}
+    if (not isinstance(plan, dict) or set(plan) != {"manifests", "generations"}
+            or not isinstance(plan["manifests"], list) or not isinstance(plan["generations"], list)
+            or any(not isinstance(digest, str) or not re.fullmatch("[0-9a-f]{64}", digest)
+                   for digest in plan["generations"])):
+        raise ValueError("invalid pending host activation state")
+    for manifest in plan["manifests"]:
+        validate(manifest, namespace)
+    return plan
 
 
 def activation_starts(manifests, previous, pending):
@@ -192,15 +252,7 @@ def activation_starts(manifests, previous, pending):
                 old[name]["installable"] != manifest["installable"]
                 or old[name]["host"]["service"]["revision"] != policy["revision"]
             )
-            if name in saved or (
-                changed
-                and subprocess.run(
-                    ["systemctl", "is-active", "--quiet", name + ".service"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                ).returncode
-                == 0
-            ):
+            if name in saved or (changed and service_active(old[name])):
                 starts.add(name)
     # Persist intent before a restart can turn an active service into a failed
     # one. A repaired package must resume that intent rather than try-restart an
@@ -209,41 +261,50 @@ def activation_starts(manifests, previous, pending):
     return starts
 
 
-def activate_host(manifests, previous, profile, target, starts):
+def activate_host(manifests, previous, profile, target, starts, cleanup, state, namespace):
     old, new = services(previous), services(manifests)
     for manifest in manifests:
         host = manifest.get("host", {})
+        if host.get("prepare"):
+            run("/usr/lib/" + namespace + "/host/" + manifest["name"])
         if host.get("sysusers"):
             run("systemd-sysusers", "/usr/lib/sysusers.d/" + manifest["name"] + ".conf")
         if host.get("tmpfiles"):
-            run(
-                "systemd-tmpfiles",
-                "--create",
-                "/usr/lib/tmpfiles.d/" + manifest["name"] + ".conf",
-            )
-    for name, manifest in old.items():
-        if name not in new:
-            unit = name + ".service"
-            if manifest["host"]["service"]["stopOnRemove"]:
-                if (
-                    run("systemctl", "show", "--property=LoadState", "--value", unit)
-                    != "not-found"
-                ):
-                    service_command("stop", unit)
-            helper = shutil.which("deb-systemd-helper")
-            run(helper or "systemctl", "disable", unit)
+            run("systemd-tmpfiles", "--create", "/usr/lib/tmpfiles.d/" + manifest["name"] + ".conf")
+    for name, manifest in services(cleanup).items():
+        if name not in new or supervisor(manifest) != supervisor(new[name]):
+            if supervisor(manifest) == "openrc":
+                control = openrc_control(manifest, state)
+                if manifest["host"]["service"]["stopOnRemove"] and service_active(manifest, control):
+                    service_command("stop", manifest, control)
+                # rc-update needs the installed runscript even for deletion on
+                # some releases; our enable link is still safe to remove after
+                # the native package has deleted that script.
+                if (Path("/etc/init.d") / name).exists():
+                    run("rc-update", "del", name, "default")
+                else:
+                    (Path("/etc/runlevels/default") / name).unlink(missing_ok=True)
+            else:
+                unit = name + ".service"
+                if manifest["host"]["service"]["stopOnRemove"]:
+                    if run("systemctl", "show", "--property=LoadState", "--value", unit) != "not-found":
+                        service_command("stop", manifest)
+                helper = shutil.which("deb-systemd-helper")
+                run(helper or "systemctl", "disable", unit)
     switch(profile, target / "profile")
-    if old or new:
+    if any(supervisor(m) == "systemd" for m in list(services(cleanup).values()) + list(new.values())):
         run("systemctl", "daemon-reload")
     for name, manifest in new.items():
         policy = manifest["host"]["service"]
-        unit = name + ".service"
-        if name not in old:
+        if name not in old or supervisor(old[name]) != supervisor(manifest):
             if policy["enable"]:
-                helper = shutil.which("deb-systemd-helper")
-                run(helper or "systemctl", "enable", unit)
+                if supervisor(manifest) == "openrc":
+                    run("rc-update", "add", name, "default")
+                else:
+                    helper = shutil.which("deb-systemd-helper")
+                    run(helper or "systemctl", "enable", name + ".service")
         if name in starts:
-            service_command("restart" if name in old else "start", unit)
+            service_command("restart" if name in old else "start", manifest)
 
 
 def reconcile(registry, state, profile, namespace="nix-impurifier"):
@@ -255,19 +316,23 @@ def reconcile(registry, state, profile, namespace="nix-impurifier"):
             raise ValueError(f"duplicate name or filename mismatch: {descriptor}")
         names.add(value["name"])
         manifests.append(value)
-    canonical = json.dumps(manifests, sort_keys=True, indent=2) + "\n"
-    digest = hashlib.sha256(canonical.encode()).hexdigest()
+    canonical = manifest_text(manifests)
+    digest = generation_id(manifests)
     generations = state / "generations"
     generations.mkdir(exist_ok=True)
     target = generations / digest
     activation = state / "activated.json"
     previous = json.loads(activation.read_text()) if activation.exists() else []
+    plan = host_plan(state, namespace)
+    cleanup_by_name = {m["name"]: m for m in previous + plan["manifests"]}
+    cleanup = [cleanup_by_name[name] for name in sorted(cleanup_by_name)]
     if (
         profile.is_symlink()
         and profile.resolve() == target / "profile"
         and previous == manifests
     ):
         (state / "pending-activation.json").unlink(missing_ok=True)
+        (state / "pending-hosts.json").unlink(missing_ok=True)
         print(f"unchanged {digest}")
         return
     if not target.exists():
@@ -313,13 +378,26 @@ def reconcile(registry, state, profile, namespace="nix-impurifier"):
         raise ValueError(f"incomplete generation: {target}; remove it and retry")
     pending = state / "pending-activation.json"
     starts = activation_starts(manifests, previous, pending)
-    activate_host(manifests, previous, profile, target, starts)
+    for name, manifest in services(manifests).items():
+        if supervisor(manifest) == "openrc":
+            cached = target / "services" / name
+            cached.parent.mkdir(exist_ok=True)
+            shutil.copyfile(Path("/etc/init.d") / name, cached)
+            cached.chmod(0o755)
+    attempted = dict(cleanup_by_name)
+    attempted.update({m["name"]: m for m in manifests})
+    atomic_write(state / "pending-hosts.json", json.dumps({
+        "manifests": [attempted[name] for name in sorted(attempted)],
+        "generations": sorted(set(plan["generations"]) | {digest}),
+    }) + "\n")
+    activate_host(manifests, previous, profile, target, starts, cleanup, state, namespace)
     atomic_write(activation, canonical)
     pending.unlink(missing_ok=True)
+    (state / "pending-hosts.json").unlink(missing_ok=True)
     print(f"activated {digest}")
 
 
-def prune(state, profile, keep):
+def prune(state, profile, keep, namespace="nix-impurifier"):
     """Drop old generation roots. Nix GC remains a separate administrator action."""
     active = profile.resolve().parent if profile.is_symlink() else None
     generations = state / "generations"
@@ -329,6 +407,10 @@ def prune(state, profile, keep):
         reverse=True,
     )
     retained = set(existing[:keep]) | {active}
+    activated = state / "activated.json"
+    if activated.exists():
+        retained.add(generations / generation_id(json.loads(activated.read_text())))
+    retained.update(generations / digest for digest in host_plan(state, namespace)["generations"])
     for generation in existing:
         if generation not in retained:
             shutil.rmtree(generation)
@@ -373,7 +455,7 @@ def main():
                 raise ValueError("no active profile")
             print((args.profile.resolve().parent / "manifest.json").read_text(), end="")
         elif args.command == "prune":
-            prune(args.state, args.profile, args.keep)
+            prune(args.state, args.profile, args.keep, args.namespace)
         else:
             reconcile(
                 args.registry,

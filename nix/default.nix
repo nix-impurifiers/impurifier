@@ -79,12 +79,20 @@ let
       users ? { },
       directories ? { },
       systemd ? null,
+      openrc ? null,
+      hostBackend ? (if openrc != null then "openrc" else "systemd"),
+      mode ? "full",
     }:
     assert lib.assertMsg (builtins.match "[a-z0-9][a-z0-9+.-]+" name != null) "invalid package name";
     assert lib.assertMsg (
       builtins.match "[A-Za-z0-9.+:~_-]+" version != null
     ) "invalid package version";
     assert lib.assertMsg (builtins.match "[^\n\r]+" description != null) "description must be one line";
+    assert lib.assertMsg (lib.elem mode [
+      "full"
+      "application"
+      "integration"
+    ]) "invalid payload mode";
     assert lib.assertMsg (builtins.isBool offline) "offline must be a boolean";
     assert lib.assertMsg (builtins.isInt priority) "priority must be an integer";
     assert lib.assertMsg (lib.all (safeFile "/etc/") (
@@ -104,6 +112,9 @@ let
           users
           directories
           systemd
+          openrc
+          hostBackend
+          namespace
           ;
       };
       flavor = if offline then "offline" else "net";
@@ -132,15 +143,18 @@ let
             offline
             ;
           hostEnabled = host.enabled;
-          configPaths = builtins.attrNames configFiles;
+          configPaths = lib.optionals (mode != "application") (builtins.attrNames configFiles);
         };
       }
       ''
-        mkdir -p $out/usr/share/nix-profile.d
-        cp ${manifest} $out/usr/share/nix-profile.d/${name}.json
-        ${copyFiles (files // host.files)}
-        ${copyFiles configFiles}
-        ${lib.optionalString offline ''
+        mkdir -p $out
+        ${lib.optionalString (mode != "integration") ''
+          mkdir -p $out/usr/share/nix-profile.d
+          cp ${manifest} $out/usr/share/nix-profile.d/${name}.json
+        ''}
+        ${lib.optionalString (mode != "application") (copyFiles (files // host.files))}
+        ${lib.optionalString (mode != "application") (copyFiles configFiles)}
+        ${lib.optionalString (offline && mode != "integration") ''
           mkdir -p $out${cacheDir}
           cp -r ${offlineCache pkg}/. $out${cacheDir}/
         ''}
