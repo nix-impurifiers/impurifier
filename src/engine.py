@@ -367,7 +367,10 @@ def activate_host(manifests, previous, profile, target, starts, cleanup, state, 
             else:
                 unit = name + ".service"
                 if manifest["host"]["service"]["stopOnRemove"]:
-                    if run("systemctl", "show", "--property=LoadState", "--value", unit) != "not-found":
+                    # A native image refresh can invalidate the unit file while
+                    # its process remains active. Stop that process as well.
+                    if (service_active(manifest)
+                            or run("systemctl", "show", "--property=LoadState", "--value", unit) != "not-found"):
                         service_command("stop", manifest)
                 helper = shutil.which("deb-systemd-helper")
                 run(helper or "systemctl", "disable", unit)
