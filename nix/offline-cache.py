@@ -8,6 +8,10 @@ import sys
 
 lines = iter(Path(sys.argv[1]).read_text().splitlines())
 output = Path(sys.argv[2])
+# Nix initializes these directories even when opening a file cache for reads.
+# Pre-create them so caches shipped in read-only images remain usable.
+for directory in ("realisations", "log"):
+    (output / directory).mkdir()
 (output / "nix-cache-info").write_text("StoreDir: /nix/store\nPriority: 1\n")
 for store_path in lines:
     nar_hash, nar_size, _deriver, count = (next(lines) for _ in range(4))

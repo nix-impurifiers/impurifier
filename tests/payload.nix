@@ -10,6 +10,7 @@ let
   integration = core.makePayload (args // { mode = "integration"; });
   full = core.makePayload args;
   runtime = core.makeRuntimeTree { };
+  cache = core.offlineCache pkgs.hello;
   runscript = pkgs.writeText "run" "#!/bin/sh\nexec /opt/nix/profile/bin/hello\n";
   runitPayload = core.makePayload {
     pkg = pkgs.hello;
@@ -39,5 +40,8 @@ pkgs.runCommand "impurifier-payload-partition-contract" { } ''
   test -f ${full}/usr/share/nix-profile.d/hello.json
   test -x ${runitPayload}/etc/sv/hello/run
   grep -x "MIT License" ${runtime}/usr/share/licenses/nix-impurifier/LICENSE
+  test -d ${cache}/realisations
+  test -d ${cache}/log
+  test -f ${cache}/nix-cache-info
   touch $out
 ''

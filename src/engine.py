@@ -356,10 +356,14 @@ def activate_host(manifests, previous, profile, target, starts, cleanup, state, 
                 # rc-update needs the installed runscript even for deletion on
                 # some releases; our enable link is still safe to remove after
                 # the native package has deleted that script.
-                if (Path("/etc/init.d") / name).exists():
-                    run("rc-update", "del", name, "default")
-                else:
-                    (Path("/etc/runlevels/default") / name).unlink(missing_ok=True)
+                enabled = Path("/etc/runlevels/default") / name
+                # Removing an already-disabled service is complete. OpenRC
+                # returns failure for rc-update del when the link is absent.
+                if enabled.exists() or enabled.is_symlink():
+                    if (Path("/etc/init.d") / name).exists():
+                        run("rc-update", "del", name, "default")
+                    else:
+                        enabled.unlink()
             else:
                 unit = name + ".service"
                 if manifest["host"]["service"]["stopOnRemove"]:
