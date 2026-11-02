@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,7 +27,7 @@ def validate(value, namespace="nix-impurifier"):
     required = {"name", "version", "priority", "installable"}
     if (
         not isinstance(value, dict)
-        or set(value) - required - {"offlineCache", "host"}
+        or set(value) - required - {"offlineCache", "host", "hardware"}
         or required - set(value)
     ):
         raise ValueError(
@@ -49,6 +51,24 @@ def validate(value, namespace="nix-impurifier"):
         != "/usr/share/" + namespace + "/offline/" + value["name"]
     ):
         raise ValueError("offline cache must use the package-owned directory")
+    if "hardware" in value:
+        bridge = value["hardware"]
+        atom = re.compile(r"[A-Za-z0-9_.+-]+\Z")
+        if (not isinstance(bridge, dict) or set(bridge) != {"libraries", "programs", "preload"}
+                or not isinstance(bridge["libraries"], dict) or not bridge["libraries"]
+                or not isinstance(bridge["programs"], list) or not bridge["programs"]
+                or not isinstance(bridge["preload"], list)):
+            raise ValueError("invalid hardware bridge")
+        for name in list(bridge["libraries"]) + bridge["programs"] + bridge["preload"]:
+            if not isinstance(name, str) or not atom.fullmatch(name) or name in {".", ".."}:
+                raise ValueError("invalid hardware library/program name")
+        for path in bridge["libraries"].values():
+            if (not isinstance(path, str) or not path.startswith("/")
+                    or not re.fullmatch(r"/[A-Za-z0-9/_.+-]+", path)
+                    or any(part in {".", ".."} for part in path.split("/"))):
+                raise ValueError("invalid hardware source path")
+        if any(name not in bridge["libraries"] for name in bridge["preload"]):
+            raise ValueError("preload must select a declared library")
     if "host" in value:
         host = value["host"]
         if (
@@ -241,7 +261,7 @@ def host_plan(state, namespace):
     return plan
 
 
-def activation_starts(manifests, previous, pending):
+def activation_starts(manifests, previous, pending, changed_hardware=frozenset()):
     old, new = services(previous), services(manifests)
     saved = json.loads(pending.read_text()) if pending.exists() else []
     if not isinstance(saved, list) or any(not isinstance(name, str) for name in saved):
@@ -256,6 +276,7 @@ def activation_starts(manifests, previous, pending):
             changed = (
                 old[name]["installable"] != manifest["installable"]
                 or old[name]["host"]["service"]["revision"] != policy["revision"]
+                or name in changed_hardware
             )
             if name in saved or (changed and service_active(old[name])):
                 starts.add(name)
@@ -322,6 +343,60 @@ def activate_host(manifests, previous, profile, target, starts, cleanup, state, 
             service_command("restart" if name in old else "start", manifest)
 
 
+def hardware_snapshots(manifests, state):
+    """Import explicitly selected host DSOs as immutable, generation-rooted data."""
+    snapshots = {}
+    for manifest in manifests:
+        if "hardware" not in manifest:
+            continue
+        with tempfile.TemporaryDirectory(prefix=".hardware-", dir=state) as tmp:
+            directory = Path(tmp) / ("host-libraries-" + manifest["name"])
+            directory.mkdir(mode=0o755)
+            for name, source in sorted(manifest["hardware"]["libraries"].items()):
+                with open(source, "rb") as stream:
+                    before = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(before.st_mode):
+                        raise ValueError("hardware library must be a regular file: " + source)
+                    data = stream.read()
+                    after = os.fstat(stream.fileno())
+                if (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                        after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                    raise ValueError("hardware library changed during capture: " + source)
+                if not data.startswith(b"\x7fELF"):
+                    raise ValueError("hardware library must be an ELF object: " + source)
+                destination = directory / name
+                destination.write_bytes(data)
+                destination.chmod(0o444)
+            snapshots[manifest["name"]] = run("nix-store", "--add", str(directory))
+    return snapshots
+
+
+def wrap_hardware(profile, manifests, snapshots):
+    claimed = set()
+    for manifest in manifests:
+        if "hardware" not in manifest:
+            continue
+        bridge = manifest["hardware"]
+        snapshot = snapshots[manifest["name"]]
+        for program in bridge["programs"]:
+            if program in claimed:
+                raise ValueError("multiple hardware wrappers for program: " + program)
+            claimed.add(program)
+            original = Path(manifest["installable"]) / "bin" / program
+            target = profile / "bin" / program
+            if not original.is_file() or not os.access(original, os.X_OK) or target.resolve() != original.resolve():
+                raise ValueError("hardware program must be the selected application's executable: " + program)
+            # compose emits a real bin directory containing leaf symlinks.
+            target.unlink()
+            preload = " ".join(str(Path(snapshot) / name) for name in bridge["preload"])
+            script = "#!/bin/sh\nexport LD_LIBRARY_PATH=" + shlex.quote(snapshot) + '${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\n'
+            if preload:
+                script += "export LD_PRELOAD=" + shlex.quote(preload) + '${LD_PRELOAD:+ $LD_PRELOAD}\n'
+            script += "exec " + shlex.quote(str(original)) + ' "$@"\n'
+            target.write_text(script)
+            target.chmod(0o755)
+
+
 def reconcile(registry, state, profile, namespace="nix-impurifier"):
     manifests = []
     names = set()
@@ -332,7 +407,9 @@ def reconcile(registry, state, profile, namespace="nix-impurifier"):
         names.add(value["name"])
         manifests.append(value)
     canonical = manifest_text(manifests)
-    digest = generation_id(manifests)
+    snapshots = hardware_snapshots(manifests, state)
+    digest = (hashlib.sha256((canonical + json.dumps(snapshots, sort_keys=True)).encode()).hexdigest()
+              if snapshots else generation_id(manifests))
     generations = state / "generations"
     generations.mkdir(exist_ok=True)
     target = generations / digest
@@ -379,10 +456,16 @@ def reconcile(registry, state, profile, namespace="nix-impurifier"):
                     "--indirect",
                     *options,
                 )
+            if snapshots:
+                (roots / "hardware").mkdir(exist_ok=True)
+            for name, snapshot in snapshots.items():
+                run("nix-store", "--realise", snapshot, "--add-root", str(roots / "hardware" / name), "--indirect")
             compose(
                 staging / "profile",
                 [(m["priority"], Path(m["installable"])) for m in manifests],
             )
+            wrap_hardware(staging / "profile", manifests, snapshots)
+            (staging / "hardware.json").write_text(json.dumps(snapshots, sort_keys=True))
             (staging / "manifest.json").write_text(canonical)
             # GC root names stay stable across publication and process crashes.
             os.rename(staging, target)
@@ -392,7 +475,19 @@ def reconcile(registry, state, profile, namespace="nix-impurifier"):
     if not (target / "manifest.json").exists() or not (target / "profile").is_dir():
         raise ValueError(f"incomplete generation: {target}; remove it and retry")
     pending = state / "pending-activation.json"
-    starts = activation_starts(manifests, previous, pending)
+    completed_generation = state / "activated-generation"
+    prior_snapshots = {}
+    if completed_generation.exists():
+        metadata = generations / completed_generation.read_text().strip() / "hardware.json"
+        if metadata.exists():
+            prior_snapshots = json.loads(metadata.read_text())
+    prior_bridges = {m["name"]: m.get("hardware") for m in previous}
+    bridges = {m["name"]: m.get("hardware") for m in manifests}
+    changed_hardware = {
+        name for name in set(prior_snapshots) | set(snapshots)
+        if prior_snapshots.get(name) != snapshots.get(name) or prior_bridges.get(name) != bridges.get(name)
+    }
+    starts = activation_starts(manifests, previous, pending, changed_hardware)
     for name, manifest in services(manifests).items():
         if supervisor(manifest) == "openrc":
             cached = target / "services" / name
@@ -406,6 +501,7 @@ def reconcile(registry, state, profile, namespace="nix-impurifier"):
         "generations": sorted(set(plan["generations"]) | {digest}),
     }) + "\n")
     activate_host(manifests, previous, profile, target, starts, cleanup, state, namespace)
+    atomic_write(state / "activated-generation", digest + "\n")
     atomic_write(activation, canonical)
     pending.unlink(missing_ok=True)
     (state / "pending-hosts.json").unlink(missing_ok=True)
@@ -425,6 +521,12 @@ def prune(state, profile, keep, namespace="nix-impurifier"):
     activated = state / "activated.json"
     if activated.exists():
         retained.add(generations / generation_id(json.loads(activated.read_text())))
+    completed_generation = state / "activated-generation"
+    if completed_generation.exists():
+        digest = completed_generation.read_text().strip()
+        if not re.fullmatch("[0-9a-f]{64}", digest):
+            raise ValueError("invalid completed generation")
+        retained.add(generations / digest)
     retained.update(generations / digest for digest in host_plan(state, namespace)["generations"])
     for generation in existing:
         if generation not in retained:

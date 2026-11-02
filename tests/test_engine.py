@@ -70,6 +70,17 @@ class ManifestTests(unittest.TestCase):
             with self.subTest(hooks=hooks), self.assertRaises(ValueError):
                 engine.validate(value | {"host": value["host"] | {"lifecycle": hooks}})
 
+    def test_hardware_paths_and_preload_are_constrained(self):
+        bridge = dict(libraries={"libdriver.so": "/usr/lib/libdriver.so"}, programs=["tool"], preload=[])
+        value = dict(name="tool", version="1", priority=5,
+                     installable="/nix/store/" + "0" * 32 + "-tool", hardware=bridge)
+        self.assertEqual(engine.validate(value), value)
+        for patch in [dict(libraries={"../escape": "/usr/lib/driver"}),
+                      dict(libraries={"libdriver.so": "/usr/lib/../driver"}),
+                      dict(preload=["undeclared.so"]), dict(programs=["../tool"])]:
+            with self.subTest(patch=patch), self.assertRaises(ValueError):
+                engine.validate(value | {"hardware": bridge | patch})
+
     def test_collision_and_priority(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -116,10 +127,12 @@ class ManifestTests(unittest.TestCase):
             completed = []
             completed_id = engine.generation_id(completed)
             pending_id = "a" * 64
-            for name in [completed_id, pending_id, "discard"]:
+            hardware_completed = "b" * 64
+            for name in [completed_id, pending_id, hardware_completed, "discard"]:
                 (state / "generations" / name / "profile").mkdir(parents=True)
                 (state / "roots" / name).mkdir(parents=True)
             (state / "activated.json").write_text(json.dumps(completed))
+            (state / "activated-generation").write_text(hardware_completed)
             (state / "pending-hosts.json").write_text(json.dumps({
                 "manifests": [], "generations": [pending_id],
             }))
@@ -127,6 +140,7 @@ class ManifestTests(unittest.TestCase):
             profile.symlink_to(state / "generations" / pending_id / "profile")
             engine.prune(state, profile, 0)
             self.assertTrue((state / "generations" / completed_id).exists())
+            self.assertTrue((state / "generations" / hardware_completed).exists())
             self.assertTrue((state / "generations" / pending_id).exists())
             self.assertFalse((state / "generations/discard").exists())
 

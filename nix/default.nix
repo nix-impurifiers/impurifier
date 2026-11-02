@@ -14,6 +14,7 @@ let
     pkgs.runCommand "${namespace}-engine-0.1.0" { nativeBuildInputs = [ pkgs.makeWrapper ]; }
       ''
         mkdir -p $out/bin $out/libexec
+        install -Dm644 ${../LICENSE} $out/share/licenses/${namespace}/LICENSE
         cp ${../src/engine.py} $out/libexec/engine.py
         makeWrapper ${pkgs.python3}/bin/python3 $out/bin/nix-profile-engine \
           --add-flags "$out/libexec/engine.py --namespace ${namespace}" \
@@ -81,6 +82,7 @@ let
       systemd ? null,
       openrc ? null,
       lifecycle ? { },
+      hardware ? null,
       hostBackend ? (if openrc != null then "openrc" else "systemd"),
       mode ? "full",
     }:
@@ -119,6 +121,32 @@ let
           namespace
           ;
       };
+      hardwareSpec =
+        if hardware == null then
+          null
+        else
+          (
+            {
+              libraries,
+              programs,
+              preload ? [ ],
+            }:
+            assert lib.assertMsg (
+              builtins.isAttrs libraries
+              && libraries != { }
+              && lib.all (safeFile "/") (builtins.attrValues libraries)
+            ) "hardware libraries require absolute safe source paths";
+            assert lib.assertMsg (lib.all (
+              value: builtins.match "[A-Za-z0-9_.+-]+" value != null && value != "." && value != ".."
+            ) (builtins.attrNames libraries ++ programs ++ preload)) "invalid hardware library or program name";
+            assert lib.assertMsg (
+              programs != [ ] && lib.all (value: builtins.hasAttr value libraries) preload
+            ) "invalid hardware programs or preload selection";
+            {
+              inherit libraries programs preload;
+            }
+          )
+            hardware;
       flavor = if offline then "offline" else "net";
       packageName = "${name}-${flavor}";
       cacheDir = "/usr/share/${namespace}/offline/${name}";
@@ -129,6 +157,7 @@ let
             installable = builtins.unsafeDiscardStringContext (toString pkg);
           }
           // lib.optionalAttrs offline { offlineCache = cacheDir; }
+          // lib.optionalAttrs (hardwareSpec != null) { hardware = hardwareSpec; }
           // lib.optionalAttrs host.enabled { host = host.manifest; }
         )
       );
@@ -175,6 +204,7 @@ let
       }
       ''
         mkdir -p $out/usr/lib/${namespace} $out${binDir}
+        install -Dm644 ${../LICENSE} $out/usr/share/licenses/${namespace}/LICENSE
         cp ${../src/engine.py} $out/usr/lib/${namespace}/engine.py
         cat > $out${binDir}/nix-profile-engine <<'SCRIPT'
         #!/bin/sh

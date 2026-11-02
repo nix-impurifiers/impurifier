@@ -9,6 +9,7 @@ let
   application = core.makePayload (args // { mode = "application"; });
   integration = core.makePayload (args // { mode = "integration"; });
   full = core.makePayload args;
+  runtime = core.makeRuntimeTree {};
 in
 assert application.configPaths == [ ];
 assert integration.configPaths == [ "/etc/impurifier-test.conf" ];
@@ -21,5 +22,6 @@ pkgs.runCommand "impurifier-payload-partition-contract" { } ''
   test ! -e ${integration}/usr/share/nix-profile.d/hello.json
   test -f ${full}/etc/impurifier-test.conf
   test -f ${full}/usr/share/nix-profile.d/hello.json
+  grep -x "MIT License" ${runtime}/usr/share/licenses/nix-impurifier/LICENSE
   touch $out
 ''
