@@ -81,9 +81,17 @@ let
       directories ? { },
       systemd ? null,
       openrc ? null,
+      runit ? null,
       lifecycle ? { },
       hardware ? null,
-      hostBackend ? (if openrc != null then "openrc" else "systemd"),
+      hostBackend ? (
+        if runit != null then
+          "runit"
+        else if openrc != null then
+          "openrc"
+        else
+          "systemd"
+      ),
       mode ? "full",
     }:
     assert lib.assertMsg (builtins.match "[a-z0-9][a-z0-9+.-]+" name != null) "invalid package name";
@@ -116,6 +124,7 @@ let
           directories
           systemd
           openrc
+          runit
           lifecycle
           hostBackend
           namespace

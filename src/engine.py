@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 STORE_PATH = re.compile(
     r"/nix/store/[0-9abcdfghijklmnpqrsvwxyz]{32}-[A-Za-z0-9+._?=-]+\Z"
@@ -73,14 +74,18 @@ def validate(value, namespace="nix-impurifier"):
         host = value["host"]
         if (
             not isinstance(host, dict)
-            or set(host) - {"sysusers", "tmpfiles", "service", "supervisor", "prepare", "lifecycle"}
+            or set(host) - {"sysusers", "tmpfiles", "service", "supervisor", "prepare", "lifecycle", "serviceDir"}
             or {"sysusers", "tmpfiles", "service"} - set(host)
             or type(host["sysusers"]) is not bool
             or type(host["tmpfiles"]) is not bool
-            or host.get("supervisor", "systemd") not in {"systemd", "openrc"}
+            or host.get("supervisor", "systemd") not in {"systemd", "openrc", "runit"}
             or type(host.get("prepare", False)) is not bool
         ):
             raise ValueError("invalid host integration")
+        service_dir = host.get("serviceDir", "/var/service")
+        if (not isinstance(service_dir, str) or not re.fullmatch(r"/[A-Za-z0-9/_.+-]+", service_dir)
+                or any(part in {".", ".."} for part in service_dir.split("/"))):
+            raise ValueError("invalid runit service directory")
         hooks = host.get("lifecycle", {})
         if (not isinstance(hooks, dict) or set(hooks) - {"onInstall", "onUpgrade"}
                 or any(not isinstance(revision, str) or not re.fullmatch("[0-9a-f]{64}", revision)
@@ -188,7 +193,40 @@ def supervisor(manifest):
     return manifest.get("host", {}).get("supervisor", "systemd")
 
 
+def runit_path(manifest):
+    enabled = Path(manifest.get("host", {}).get("serviceDir", "/var/service")) / manifest["name"]
+    return enabled if enabled.is_dir() else Path("/etc/sv") / manifest["name"]
+
+
+def enable_runit(manifest):
+    source = Path("/etc/sv") / manifest["name"]
+    enabled = Path(manifest.get("host", {}).get("serviceDir", "/var/service")) / manifest["name"]
+    enabled.parent.mkdir(parents=True, exist_ok=True)
+    down = source / "down"
+    marker = b"# nix-impurifier pending enable\n"
+    owned_down = not down.exists() or down.read_bytes() == marker
+    if not down.exists():
+        down.write_bytes(marker)
+    if not enabled.is_symlink():
+        enabled.symlink_to(source)
+    deadline = time.monotonic() + 15
+    while subprocess.run(["sv", "status", str(source)], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL).returncode != 0:
+        if time.monotonic() >= deadline:
+            # Keep our marker across failure: a late supervisor must not start
+            # a service before activation has recovered.
+            raise ValueError("runit supervisor did not attach to service: " + manifest["name"])
+        time.sleep(0.05)
+    if owned_down:
+        down.unlink(missing_ok=True)
+
+
+
 def service_active(manifest, control=None):
+    if supervisor(manifest) == "runit":
+        status = subprocess.run(["sv", "status", str(runit_path(manifest))],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        return status.returncode == 0 and status.stdout.startswith("run:")
     if supervisor(manifest) == "openrc":
         command = [str(control), "status"] if control else ["rc-service", manifest["name"], "status"]
     else:
@@ -197,7 +235,9 @@ def service_active(manifest, control=None):
 
 
 def service_command(action, manifest, control=None):
-    if supervisor(manifest) == "openrc":
+    if supervisor(manifest) == "runit":
+        run("sv", "-w", "15", {"start": "up", "stop": "down"}.get(action, action), str(runit_path(manifest)))
+    elif supervisor(manifest) == "openrc":
         if control:
             run(str(control), action)
         else:
@@ -299,7 +339,13 @@ def activate_host(manifests, previous, profile, target, starts, cleanup, state, 
             run("systemd-tmpfiles", "--create", "/usr/lib/tmpfiles.d/" + manifest["name"] + ".conf")
     for name, manifest in services(cleanup).items():
         if name not in new or supervisor(manifest) != supervisor(new[name]):
-            if supervisor(manifest) == "openrc":
+            if supervisor(manifest) == "runit":
+                if manifest["host"]["service"]["stopOnRemove"] and service_active(manifest):
+                    service_command("stop", manifest)
+                enabled = Path(manifest["host"].get("serviceDir", "/var/service")) / name
+                if enabled.is_symlink():
+                    enabled.unlink()
+            elif supervisor(manifest) == "openrc":
                 control = openrc_control(manifest, state)
                 if manifest["host"]["service"]["stopOnRemove"] and service_active(manifest, control):
                     service_command("stop", manifest, control)
@@ -334,7 +380,9 @@ def activate_host(manifests, previous, profile, target, starts, cleanup, state, 
         policy = manifest["host"]["service"]
         if name not in old or supervisor(old[name]) != supervisor(manifest):
             if policy["enable"]:
-                if supervisor(manifest) == "openrc":
+                if supervisor(manifest) == "runit":
+                    enable_runit(manifest)
+                elif supervisor(manifest) == "openrc":
                     run("rc-update", "add", name, "default")
                 else:
                     helper = shutil.which("deb-systemd-helper")

@@ -6,8 +6,16 @@
   directories,
   systemd,
   openrc ? null,
+  runit ? null,
   lifecycle ? { },
-  hostBackend ? (if openrc != null then "openrc" else "systemd"),
+  hostBackend ? (
+    if runit != null then
+      "runit"
+    else if openrc != null then
+      "openrc"
+    else
+      "systemd"
+  ),
   namespace ? "nix-impurifier",
 }:
 let
@@ -90,11 +98,14 @@ let
         inherit policy;
       };
   service =
-    if hostBackend == "openrc" then
+    if hostBackend == "runit" then
+      normalizeService "run" (if runit == null then null else builtins.removeAttrs runit [ "serviceDir" ])
+    else if hostBackend == "openrc" then
       normalizeService "script" openrc
     else
       normalizeService "unit" systemd;
-  prepare = hostBackend == "openrc" && (users != { } || directories != { });
+  serviceDir = if runit == null then "/var/service" else runit.serviceDir or "/var/service";
+  prepare = hostBackend != "systemd" && (users != { } || directories != { });
   userLines = lib.concatStringsSep "\n" (
     lib.mapAttrsToList (user: spec: ''
       g ${spec.group} -
@@ -147,10 +158,19 @@ in
 assert lib.assertMsg (lib.elem hostBackend [
   "systemd"
   "openrc"
+  "runit"
 ]) "unsupported host backend";
 assert lib.assertMsg (
   systemd == null || hostBackend == "systemd"
 ) "systemd declarations require the systemd host backend";
+assert lib.assertMsg (
+  runit == null || (hostBackend == "runit" && safePath serviceDir)
+) "runit requires safe serviceDir and the runit host backend";
+assert lib.assertMsg (
+  hostBackend != "runit"
+  || service == null
+  || (service.policy.stopOnRemove && (service.policy.enable || !service.policy.startOnInstall))
+) "runit requires stopOnRemove; starting an unenabled service is unsupported";
 assert lib.assertMsg (
   openrc == null || hostBackend == "openrc"
 ) "OpenRC declarations require the OpenRC host backend";
@@ -167,6 +187,12 @@ assert lib.assertMsg (
     }
     // lib.optionalAttrs (service != null && hostBackend == "openrc") {
       "/etc/init.d/${name}" = {
+        source = service.source;
+        mode = "0755";
+      };
+    }
+    // lib.optionalAttrs (service != null && hostBackend == "runit") {
+      "/etc/sv/${name}/run" = {
         source = service.source;
         mode = "0755";
       };
@@ -203,9 +229,10 @@ assert lib.assertMsg (
       _: source: builtins.hashString "sha256" (builtins.unsafeDiscardStringContext (toString source))
     ) lifecycleScripts;
   }
-  // lib.optionalAttrs (hostBackend == "openrc") {
-    supervisor = "openrc";
+  // lib.optionalAttrs (hostBackend != "systemd") {
+    supervisor = hostBackend;
     inherit prepare;
-  };
+  }
+  // lib.optionalAttrs (hostBackend == "runit") { inherit serviceDir; };
   enabled = users != { } || directories != { } || service != null || lifecycle != { };
 }

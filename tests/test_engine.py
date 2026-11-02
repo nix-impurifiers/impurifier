@@ -81,6 +81,15 @@ class ManifestTests(unittest.TestCase):
             with self.subTest(patch=patch), self.assertRaises(ValueError):
                 engine.validate(value | {"hardware": bridge | patch})
 
+    def test_runit_service_directory_is_constrained(self):
+        value = dict(name="tool", version="1", priority=5,
+                     installable="/nix/store/" + "0" * 32 + "-tool",
+                     host=dict(sysusers=False, tmpfiles=False, service=None,
+                               supervisor="runit", prepare=True, serviceDir="/var/service"))
+        self.assertEqual(engine.validate(value), value)
+        with self.assertRaises(ValueError):
+            engine.validate(value | {"host": value["host"] | {"serviceDir": "/var/../service"}})
+
     def test_collision_and_priority(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
