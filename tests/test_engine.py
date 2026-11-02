@@ -90,6 +90,15 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             engine.validate(value | {"host": value["host"] | {"serviceDir": "/var/../service"}})
 
+    def test_preparation_revision_must_be_a_digest(self):
+        value = dict(name="tool", version="1", priority=5,
+                     installable="/nix/store/" + "0" * 32 + "-tool",
+                     host=dict(sysusers=True, tmpfiles=True, service=None,
+                               preparationRevision="a" * 64))
+        self.assertEqual(engine.validate(value), value)
+        with self.assertRaises(ValueError):
+            engine.validate(value | {"host": value["host"] | {"preparationRevision": "changed"}})
+
     def test_collision_and_priority(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)

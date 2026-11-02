@@ -74,7 +74,7 @@ def validate(value, namespace="nix-impurifier"):
         host = value["host"]
         if (
             not isinstance(host, dict)
-            or set(host) - {"sysusers", "tmpfiles", "service", "supervisor", "prepare", "lifecycle", "serviceDir"}
+            or set(host) - {"sysusers", "tmpfiles", "service", "supervisor", "prepare", "lifecycle", "serviceDir", "preparationRevision"}
             or {"sysusers", "tmpfiles", "service"} - set(host)
             or type(host["sysusers"]) is not bool
             or type(host["tmpfiles"]) is not bool
@@ -82,6 +82,10 @@ def validate(value, namespace="nix-impurifier"):
             or type(host.get("prepare", False)) is not bool
         ):
             raise ValueError("invalid host integration")
+        if "preparationRevision" in host and (
+                not isinstance(host["preparationRevision"], str)
+                or not re.fullmatch("[0-9a-f]{64}", host["preparationRevision"])):
+            raise ValueError("invalid host preparation revision")
         service_dir = host.get("serviceDir", "/var/service")
         if (not isinstance(service_dir, str) or not re.fullmatch(r"/[A-Za-z0-9/_.+-]+", service_dir)
                 or any(part in {".", ".."} for part in service_dir.split("/"))):

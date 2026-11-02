@@ -135,14 +135,23 @@ let
     set -eu
     ${lib.concatMapStringsSep "\n" (group: ''
       if ! /usr/bin/python3 -c 'import grp,sys; grp.getgrnam(sys.argv[1])' ${lib.escapeShellArg group} >/dev/null 2>&1; then
-        busybox addgroup -S ${lib.escapeShellArg group}
+        if command -v groupadd >/dev/null 2>&1; then
+          groupadd -r ${lib.escapeShellArg group}
+        else
+          busybox addgroup -S ${lib.escapeShellArg group}
+        fi
       fi
     '') (lib.unique (lib.mapAttrsToList (_: spec: spec.group) userSpec))}
     ${lib.concatStringsSep "\n" (
       lib.mapAttrsToList (user: spec: ''
         if ! /usr/bin/python3 -c 'import pwd,sys; pwd.getpwnam(sys.argv[1])' ${lib.escapeShellArg user} >/dev/null 2>&1; then
-          busybox adduser -S -D -H -h ${lib.escapeShellArg spec.home} -g ${lib.escapeShellArg spec.description} \
-            -s /sbin/nologin -G ${lib.escapeShellArg spec.group} ${lib.escapeShellArg user}
+          if command -v useradd >/dev/null 2>&1; then
+            useradd -r -M -d ${lib.escapeShellArg spec.home} -c ${lib.escapeShellArg spec.description} \
+              -s /sbin/nologin -g ${lib.escapeShellArg spec.group} ${lib.escapeShellArg user}
+          else
+            busybox adduser -S -D -H -h ${lib.escapeShellArg spec.home} -g ${lib.escapeShellArg spec.description} \
+              -s /sbin/nologin -G ${lib.escapeShellArg spec.group} ${lib.escapeShellArg user}
+          fi
         fi
       '') userSpec
     )}
@@ -223,6 +232,14 @@ assert lib.assertMsg (
             builtins.unsafeDiscardStringContext (toString service.source)
           );
         };
+  }
+  // lib.optionalAttrs (users != { } || directories != { }) {
+    preparationRevision = builtins.hashString "sha256" (
+      builtins.toJSON {
+        inherit userLines directoryLines;
+        helper = if prepare then builtins.unsafeDiscardStringContext (toString prepareScript) else "";
+      }
+    );
   }
   // lib.optionalAttrs (lifecycle != { }) {
     lifecycle = lib.mapAttrs (

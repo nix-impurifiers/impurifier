@@ -2,6 +2,11 @@
 {
   pkgs,
   namespace ? "nix-impurifier",
+  sourceInfo ? { },
+  # Native package ordering follows the pinned source, not SemVer releases.
+  runtimeVersion ? "1.${
+    toString (if builtins.isAttrs sourceInfo then sourceInfo.lastModified or 0 else 0)
+  }",
 }:
 let
   inherit (pkgs) lib;
@@ -11,7 +16,8 @@ let
     && builtins.match "[A-Za-z0-9/_.+-]+" path != null
     && lib.all (part: part != "." && part != "..") (lib.splitString "/" path);
   engine =
-    pkgs.runCommand "${namespace}-engine-0.1.0" { nativeBuildInputs = [ pkgs.makeWrapper ]; }
+    pkgs.runCommand "${namespace}-engine-${runtimeVersion}"
+      { nativeBuildInputs = [ pkgs.makeWrapper ]; }
       ''
         mkdir -p $out/bin $out/libexec
         install -Dm644 ${../LICENSE} $out/share/licenses/${namespace}/LICENSE
@@ -223,8 +229,12 @@ let
         chmod 755 $out${binDir}/nix-profile-engine
       '';
 in
+assert lib.assertMsg (
+  builtins.match "[0-9]+(\\.[0-9]+)*" runtimeVersion != null
+) "invalid native runtime version";
 {
   inherit
+    runtimeVersion
     engine
     offlineCache
     makePayload
