@@ -4,12 +4,36 @@ import json
 import pathlib
 import tempfile
 import unittest
+from unittest.mock import patch
+import subprocess
 
 spec = importlib.util.spec_from_file_location(
     "engine", pathlib.Path(__file__).parents[1] / "src/engine.py"
 )
 engine = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(engine)
+
+
+class SystemdRemovalTests(unittest.TestCase):
+    def test_missing_disabled_unit_is_already_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(engine, 'run', side_effect=[subprocess.CalledProcessError(1, 'disable'), '']):
+                engine.disable_systemd_unit('gone.service', (pathlib.Path(directory),))
+
+    def test_disable_errors_survive_for_existing_unit_or_dangling_alias(self):
+        for kind in ('fragment', 'enable', 'alias'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                fragment = root / 'gone.service'
+                if kind == 'fragment':
+                    fragment.write_text('[Service]\nExecStart=/bin/true\n')
+                else:
+                    wants = root / 'multi-user.target.wants'
+                    wants.mkdir()
+                    (wants / ('gone.service' if kind == 'enable' else 'alias.service')).symlink_to('/removed/gone.service')
+                with patch.object(engine, 'run', side_effect=[subprocess.CalledProcessError(1, 'disable'), str(fragment)]):
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        engine.disable_systemd_unit('gone.service', (root,))
 
 
 class ManifestTests(unittest.TestCase):

@@ -124,6 +124,22 @@ def run(*args):
     ).stdout.strip()
 
 
+def disable_systemd_unit(unit, config_dirs=(Path('/etc/systemd/system'), Path('/run/systemd/system'))):
+    """An absent unit with no enable/alias links is already disabled."""
+    try:
+        run('systemctl', 'disable', unit)
+    except subprocess.CalledProcessError:
+        # systemctl fails when a package removed an already-disabled unit.
+        # Retain failures for extant files or enable/alias links needing cleanup.
+        fragment = run('systemctl', 'show', '--property=FragmentPath', '--value', unit)
+        if fragment and Path(fragment).exists():
+            raise
+        for directory in config_dirs:
+            for path in directory.rglob('*'):
+                if path.is_symlink() and (path.name == unit or Path(os.readlink(path)).name == unit):
+                    raise
+
+
 def compose(destination, entries):
     """Merge directories; fail on equal-priority leaf collisions, including file/dir."""
     destination.mkdir(parents=True, exist_ok=True)
@@ -373,7 +389,10 @@ def activate_host(manifests, previous, profile, target, starts, cleanup, state, 
                             or run("systemctl", "show", "--property=LoadState", "--value", unit) != "not-found"):
                         service_command("stop", manifest)
                 helper = shutil.which("deb-systemd-helper")
-                run(helper or "systemctl", "disable", unit)
+                if helper:
+                    run(helper, "disable", unit)
+                else:
+                    disable_systemd_unit(unit)
     switch(profile, target / "profile")
     if any(supervisor(m) == "systemd" for m in list(services(cleanup).values()) + list(new.values())):
         run("systemctl", "daemon-reload")
