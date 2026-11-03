@@ -35,6 +35,12 @@ pkgs.testers.runNixOSTest {
         machine.succeed("chroot /srv/target /usr/bin/native-second | grep native-second-1")
         machine.succeed("test ! -e /srv/target/usr/bin/nix && test ! -e /srv/target/usr/bin/nix-store && test ! -e /srv/target/nix/var/nix/db/db.sqlite && test ! -e /srv/target/nix/var/nix/daemon-socket/socket")
         machine.succeed(${builtins.toJSON verify})
+    with subtest("native verification detects altered payload data"):
+        executable = machine.succeed("readlink /srv/target/usr/bin/native-first").strip()
+        machine.succeed("cp -a /srv/target" + executable + " /tmp/saved-native-command; printf x >> /srv/target" + executable)
+        machine.fail(${builtins.toJSON verify})
+        machine.succeed("cp -a /tmp/saved-native-command /srv/target" + executable)
+        machine.succeed(${builtins.toJSON verify})
     with subtest("upgrade and remove one application while retaining shared dependencies"):
         machine.succeed("rm /tmp/packages/*; cp ${upgraded}/* /tmp/packages/")
         machine.succeed(${builtins.toJSON upgrade})
