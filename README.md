@@ -110,3 +110,14 @@ performing store operations; a failed operation is never retried with a differen
 client. Store destination and trust remain Nix configuration, not executable
 selection policy. These options currently apply to shared-engine consumers;
 per-prefix launchers require their own integration and verification.
+
+`makeNativeTrees { pkg; name ? pkg.pname; version ? pkg.version;
+programs ? [ pkg.meta.mainProgram or pkg.pname ]; binDir ? "/usr/bin"; }`
+exports native-format-neutral package trees. `packages.json` lists package
+identities; each directory contains `tree/` and `metadata.json` with `name`,
+`version`, and `dependencies`. Store objects additionally record `storePath`.
+The `nix-store-<store hash>` identity namespace is reserved. Reference edges omit
+self references. Backends translate them into their own exact native dependency
+expressions and compile their own archives. Empty `programs` permits a dependency
+or library payload without command exports. This is build-time metadata; no
+runtime registry or Nix database is created.

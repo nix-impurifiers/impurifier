@@ -93,6 +93,46 @@ let
           cp -a "$path" "$out$path"
         done < ${closure}/store-paths
       '';
+  # Native backends compile these trees and reference edges into their own formats.
+  makeNativeTrees =
+    {
+      pkg,
+      name ? pkg.pname,
+      version ? pkg.version,
+      programs ? [ (pkg.meta.mainProgram or pkg.pname) ],
+      binDir ? "/usr/bin",
+    }:
+    assert lib.assertMsg (
+      builtins.match "[a-z0-9][a-z0-9+.-]+" name != null && !lib.hasPrefix "nix-store-" name
+    ) "invalid or reserved native application name";
+    assert lib.assertMsg (
+      builtins.match "[A-Za-z0-9.+:~_^=-]+" version != null
+    ) "invalid native application version";
+    assert lib.assertMsg (safeFile "/" binDir) "invalid native command directory";
+    assert lib.assertMsg (lib.all (
+      p: builtins.match "[A-Za-z0-9_+.-]+" p != null && p != "." && p != ".."
+    ) programs) "invalid native command names";
+    let
+      closure = pkgs.closureInfo { rootPaths = [ pkg ]; };
+      specification = pkgs.writeText "native-trees.json" (
+        builtins.toJSON {
+          inherit
+            name
+            version
+            programs
+            binDir
+            ;
+          installable = toString pkg;
+        }
+      );
+    in
+    pkgs.runCommand "${name}-${version}-native-trees"
+      {
+        nativeBuildInputs = [ pkgs.python3 ];
+      }
+      ''
+        python3 ${./native-trees.py} ${closure}/registration ${specification} "$out"
+      '';
   makePayload =
     {
       pkg,
@@ -279,6 +319,7 @@ assert lib.assertMsg (
     engine
     offlineCache
     makeNativePayload
+    makeNativeTrees
     makePayload
     makeRuntimeTree
     ;
