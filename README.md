@@ -81,3 +81,32 @@ Consumers select compatible libraries, their non-Nix dependencies, paths and nat
 Runit integration accepts `runit.run` and optional `runit.serviceDir` (default `/var/service`). Native service sources live in `/etc/sv/<name>`; an existing runsvdir must watch the selected enable directory. Accounts/directories use the same native account helper. The engine verifies a live supervisor connection rather than trusting stale control files, preserves admin stops/disables, and retains a temporary down marker across failed enable attempts. Enabled-but-initially-stopped services are supported. This adapter requires `stopOnRemove = true`; starting an unenabled service is rejected during emission. The XBPS VM suite verifies the runit contract, including supervisor absence and retry.
 
 Native backends pass their pinned source metadata as `sourceInfo`. `runtimeVersion` derives a numeric native package version from that source's last-modified timestamp, so repository updates can upgrade the engine and newly emitted applications require a sufficiently recent runtime. This is artifact/dependency metadata, not project SemVer release tagging. Direct imports can override `runtimeVersion` when managing a different native version policy. Host preparation has a descriptor revision of its own: changing users or directory ownership/modes is reconciled even when the application output and upstream version stay the same.
+
+## Native-owned payloads and optional runtime clients
+
+`makeNativePayload { pkg = myPackage; }` copies the complete Nix runtime closure
+into a filesystem tree at its original absolute store paths. It emits no Nix
+registration, daemon, profile manifests, or target-side database. The consumer
+must provide native ownership and command/application integration. No relocation
+is performed. Inputs are consumer-provided derivations; they need not originate
+in nixpkgs. The resulting programs must support the target environment.
+
+Native-owned files must not simultaneously be managed and garbage-collected by
+Nix. Merely finding an external Nix executable does not register or transfer
+ownership of native payloads. Backends must define ownership and coexistence
+before enabling optional Nix operations for those payloads.
+
+`makeRuntimeTree` additionally accepts `bundledNixStore`, a static ELF
+`nix-store` executable, and `bundledNixNotices`, a nonempty list of upstream
+license/notice files. Supply all notices and corresponding source obligations
+appropriate to the binary. The executable is installed in the backend's private
+library directory. Bundling an executable does not provision daemon accounts,
+configure trust, or make store operations database-free.
+
+The engine prefers a compatible external `nix-store` on its configured PATH,
+then its bundled client. `IMPURIFIER_NIX_STORE=/absolute/path` makes an explicit
+selection and disables fallback. Selection checks the client version before
+performing store operations; a failed operation is never retried with a different
+client. Store destination and trust remain Nix configuration, not executable
+selection policy. These options currently apply to shared-engine consumers;
+per-prefix launchers require their own integration and verification.

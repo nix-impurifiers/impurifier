@@ -118,7 +118,32 @@ def validate(value, namespace="nix-impurifier"):
     return value
 
 
+def select_nix_store():
+    """Select a client before mutation; never retry a failed operation elsewhere."""
+    explicit = os.environ.get("IMPURIFIER_NIX_STORE")
+    candidates = [explicit] if explicit else [
+        shutil.which("nix-store"), os.environ.get("IMPURIFIER_BUNDLED_NIX_STORE")
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if not os.path.isabs(candidate):
+            raise ValueError("Nix executable selection must use an absolute path")
+        try:
+            result = subprocess.run([candidate, "--version"], check=True,
+                                    text=True, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, timeout=10)
+            match = re.search(r"\b(?:Nix|Lix)\)?\s+(\d+)\.(\d+)", result.stdout)
+            if match and tuple(map(int, match.groups())) >= (2, 0):
+                return candidate
+        except (OSError, subprocess.SubprocessError):
+            pass
+    raise ValueError("no compatible Nix store client; supply external or bundled Nix >= 2")
+
+
 def run(*args):
+    if args and args[0] == "nix-store":
+        args = (select_nix_store(), *args[1:])
     return subprocess.run(
         args, check=True, text=True, stdout=subprocess.PIPE
     ).stdout.strip()

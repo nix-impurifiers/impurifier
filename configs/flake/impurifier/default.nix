@@ -16,6 +16,7 @@
     {
       packages.default = core.engine;
       checks.unit = core.unit;
+      checks.native-payload = import ../../../tests/native-payload.nix { inherit pkgs core; };
       checks.payload = import ../../../tests/payload.nix { inherit pkgs core; };
       formatter = pkgs.nixfmt-tree;
     };

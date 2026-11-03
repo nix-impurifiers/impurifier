@@ -73,6 +73,26 @@ let
         ''install -Dm${asset.mode} ${lib.escapeShellArg (toString asset.source)} "$out${path}"''
       ) assets
     );
+  # Native consumers own these files. No target-side Nix registration is emitted.
+  makeNativePayload =
+    { pkg }:
+    let
+      closure = pkgs.closureInfo { rootPaths = [ pkg ]; };
+    in
+    pkgs.runCommand "${pkg.pname or pkg.name}-native-payload"
+      {
+        passthru = {
+          inherit closure;
+          installable = pkg;
+        };
+      }
+      ''
+        mkdir -p "$out"
+        while IFS= read -r path; do
+          mkdir -p "$out$(dirname "$path")"
+          cp -a "$path" "$out$path"
+        done < ${closure}/store-paths
+      '';
   makePayload =
     {
       pkg,
@@ -208,22 +228,43 @@ let
   makeRuntimeTree =
     {
       binDir ? "/usr/sbin",
+      bundledNixStore ? null,
+      bundledNixNotices ? [ ],
     }:
     assert lib.assertMsg (lib.elem binDir [
       "/usr/bin"
       "/usr/sbin"
     ]) "invalid runtime binDir";
+    assert lib.assertMsg (
+      bundledNixStore == null || bundledNixNotices != [ ]
+    ) "bundled Nix requires upstream license notices";
     pkgs.runCommand "${namespace}-runtime-tree"
       {
+        nativeBuildInputs = lib.optionals (bundledNixStore != null) [ pkgs.buildPackages.binutils ];
         passthru.binaryPath = "${binDir}/nix-profile-engine";
       }
       ''
         mkdir -p $out/usr/lib/${namespace} $out${binDir}
         install -Dm644 ${../LICENSE} $out/usr/share/licenses/${namespace}/LICENSE
         cp ${../src/engine.py} $out/usr/lib/${namespace}/engine.py
+        ${lib.optionalString (bundledNixStore != null) ''
+          readelf -h ${lib.escapeShellArg (toString bundledNixStore)} > /dev/null
+          if readelf -l ${lib.escapeShellArg (toString bundledNixStore)} | grep -q INTERP; then
+            echo "bundledNixStore must be a static ELF executable" >&2
+            exit 1
+          fi
+          install -Dm755 ${lib.escapeShellArg (toString bundledNixStore)} $out/usr/lib/${namespace}/nix-store
+          ${lib.concatImapStringsSep "\n" (
+            i: notice:
+            "install -Dm644 ${lib.escapeShellArg (toString notice)} $out/usr/share/licenses/${namespace}/bundled-nix/${toString i}"
+          ) bundledNixNotices}
+        ''}
         cat > $out${binDir}/nix-profile-engine <<'SCRIPT'
         #!/bin/sh
         export PATH=/usr/sbin:/usr/bin:/sbin:/bin:/nix/var/nix/profiles/default/bin
+        ${lib.optionalString (
+          bundledNixStore != null
+        ) "export IMPURIFIER_BUNDLED_NIX_STORE=/usr/lib/${namespace}/nix-store"}
         exec /usr/bin/python3 /usr/lib/${namespace}/engine.py --namespace ${namespace} "$@"
         SCRIPT
         chmod 755 $out${binDir}/nix-profile-engine
@@ -237,12 +278,14 @@ assert lib.assertMsg (
     runtimeVersion
     engine
     offlineCache
+    makeNativePayload
     makePayload
     makeRuntimeTree
     ;
   unit = pkgs.runCommand "impurifier-unit" { nativeBuildInputs = [ pkgs.python3 ]; } ''
     cp -r ${../.} source
     python3 source/tests/test_engine.py
+    python3 source/tests/test_runtime.py
     touch $out
   '';
 }
